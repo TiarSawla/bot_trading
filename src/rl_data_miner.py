@@ -71,7 +71,7 @@ def fetch_mt5_data(symbol, timeframe, num_bars):
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
         # Check standard symbol variations
-        alternatives = [symbol, symbol + "m", "GOLD", "XAUUSD"]
+        alternatives = [symbol, symbol + "m", symbol + "b", "GOLD", "XAUUSD"]
         found_symbol = None
         for alt in alternatives:
             info = mt5.symbol_info(alt)
