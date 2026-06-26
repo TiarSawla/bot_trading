@@ -144,6 +144,13 @@ def compute_features(df):
     df['fvg_status'] = 0
     df.loc[df['low'] > df['high'].shift(2), 'fvg_status'] = 1
     df.loc[df['high'] < df['low'].shift(2), 'fvg_status'] = -1
+    
+    # Kalkulasi Volume Moving Average (SMA Volume 20)
+    vol_col = 'real_volume' if ('real_volume' in df.columns and df['real_volume'].astype(float).sum() > 0) else 'tick_volume'
+    if vol_col not in df.columns:
+        vol_col = 'volume'
+    df['volume_sma_20'] = df[vol_col].rolling(window=20).mean()
+    
     return df
 
 def get_live_state(symbol):
@@ -330,7 +337,7 @@ def is_kill_zone_active():
     """
     Memeriksa apakah waktu saat ini berada di dalam salah satu Kill Zone (WIB - UTC+7).
     Zone 1 (London): 14:00 - 17:00 WIB
-    Zone 2 (New York Overlap): 19:00 - 22:30 WIB
+    Zone 2 (New York Overlap - Safe Mode): 19:00 - 03:00 WIB (dini hari berikutnya)
     """
     import datetime
     now = datetime.datetime.now()
@@ -340,20 +347,20 @@ def is_kill_zone_active():
     zone1_end = datetime.time(17, 0)
     
     zone2_start = datetime.time(19, 0)
-    zone2_end = datetime.time(22, 30)
+    zone2_end = datetime.time(3, 0)
     
     in_zone1 = zone1_start <= current_time <= zone1_end
-    in_zone2 = zone2_start <= current_time <= zone2_end
+    in_zone2 = (current_time >= zone2_start) or (current_time <= zone2_end)
     
     return in_zone1 or in_zone2
 
 
 def check_macro_trend(symbol):
     try:
-        # Tarik 250 candle terakhir dari timeframe H4
-        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H4, 0, 250)
+        # Tarik 250 candle terakhir dari timeframe H1
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, 250)
         if rates is None or len(rates) < 200:
-            logger.warning(f"[MTF Filter] Gagal mengambil data H4 cukup ({len(rates) if rates is not None else 0}/200). Filter dilewati.")
+            logger.warning(f"[MTF Filter H1] Gagal mengambil data H1 cukup ({len(rates) if rates is not None else 0}/200). Filter dilewati.")
             return None # Lewati filter jika data gagal ditarik
         
         df = pd.DataFrame(rates)
@@ -364,17 +371,17 @@ def check_macro_trend(symbol):
         last_ema = df['ema_200'].iloc[-1]
         
         if pd.isna(last_ema):
-            logger.warning("[MTF Filter] Kalkulasi EMA 200 H4 menghasilkan NaN. Filter dilewati.")
+            logger.warning("[MTF Filter H1] Kalkulasi EMA 200 H1 menghasilkan NaN. Filter dilewati.")
             return None
             
-        logger.info(f"[MTF Filter] H4 Close: {last_close:.3f} | H4 EMA 200: {last_ema:.3f}")
+        logger.info(f"[MTF Filter H1] H1 Close: {last_close:.3f} | H1 EMA 200: {last_ema:.3f}")
         # Return 1 untuk Bullish (Hanya boleh BUY), 0 untuk Bearish (Hanya boleh SELL)
         if last_close > last_ema:
             return 1
         elif last_close < last_ema:
             return 0
     except Exception as e:
-        logger.error(f"[MTF Filter] Error dalam check_macro_trend: {e}")
+        logger.error(f"[MTF Filter H1] Error dalam check_macro_trend: {e}")
     return None
 
 
@@ -645,13 +652,11 @@ def bot_job():
         update_trailing_stop(SYMBOL, atr_value)
         
         # --- SESSION FILTER (KILL ZONES) ---
-        positions = mt5.positions_get(symbol=SYMBOL)
         if not is_kill_zone_active():
-            if positions is None or len(positions) == 0:
-                logger.info('[SESSION FILTER] Di luar London/NY Kill Zone. Menunggu volatilitas pasar...')
-                elapsed = time.time() - start_time
-                logger.info(f'=== Siklus Evaluasi Selesai (Durasi: {elapsed:.2f} detik) ===')
-                return
+            logger.info('[SESSION FILTER] Di luar London/NY Kill Zone. Menunggu volatilitas pasar...')
+            elapsed = time.time() - start_time
+            logger.info(f'=== Siklus Evaluasi Selesai (Durasi: {elapsed:.2f} detik) ===')
+            return
         
         # --- REGIME SWITCHER ---
         adx_value = df['ADX_14'].iloc[-1]
@@ -664,31 +669,74 @@ def bot_job():
             action_name = 'BUY' if action_val == 1 else 'SELL'
             logger.info(f'[{mode_str}] Prediksi Model: Action={action_val} ({action_name}){probs_log}')
             
-            # --- SMC FILTER (ORDER BLOCK GATEKEEPER) ---
+            # Check macro trend first
+            macro_trend = check_macro_trend(SYMBOL)
+            
+            # --- SMC FILTER (ORDER BLOCK GATEKEEPER) & VOLUME BREAKOUT OVERRIDE ---
             ob_info = detect_order_block(SYMBOL, mt5.TIMEFRAME_M15)
+            
+            # Determine volume column and values for breakout check
+            vol_col = 'real_volume' if ('real_volume' in df.columns and df['real_volume'].astype(float).sum() > 0) else 'tick_volume'
+            if vol_col not in df.columns:
+                vol_col = 'volume'
+            current_volume = float(df[vol_col].iloc[-1])
+            volume_sma_20 = float(df['volume_sma_20'].iloc[-1])
+            
+            # 2. Hitung Momentum Breakout
+            is_volume_breakout = current_volume > (2.0 * volume_sma_20)
+            
             if ob_info is not None:
                 ob_top, ob_bottom, ob_type = ob_info
-                logger.info(f"[SMC FILTER] Order Block Terdeteksi: Tipe={ob_type}, Top={ob_top:.3f}, Bottom={ob_bottom:.3f} | Harga Saat Ini: {current_price:.3f}")
+                
+                # 1. Hitung Buffer
+                buffer = 0.5 * atr_value
+                ob_valid_buy = (ob_bottom - buffer) <= current_price <= (ob_top + buffer) and ob_type == 'bullish'
+                ob_valid_sell = (ob_bottom - buffer) <= current_price <= (ob_top + buffer) and ob_type == 'bearish'
+                
+                logger.info(f"[SMC FILTER] Order Block Terdeteksi: Tipe={ob_type}, Top={ob_top:.3f}, Bottom={ob_bottom:.3f} | Buffer: {buffer:.4f} | Harga Saat Ini: {current_price:.3f} | Volume: {current_volume} | SMA Volume 20: {volume_sma_20:.2f}")
+                
+                # 3. Eksekusi Keputusan
                 if action_val == 1: # BUY
-                    if not (ob_type == "bullish" and ob_bottom <= current_price <= ob_top):
-                        logger.info("[SMC FILTER] Harga tidak berada di zona Order Block. Mengabaikan sinyal AI.")
-                        action_val = 2
+                    if ob_valid_buy or is_volume_breakout:
+                        # Lanjutkan eksekusi BUY (Pastikan MTF H1 juga mengizinkan)
+                        if macro_trend is not None and macro_trend == 0:
+                            logger.info("Sinyal BUY dibatalkan: Melawan tren makro Bearish (H1).")
+                            elapsed = time.time() - start_time
+                            logger.info(f'=== Siklus Evaluasi Selesai (Durasi: {elapsed:.2f} detik) ===')
+                            return
+                        else:
+                            if is_volume_breakout and not ob_valid_buy:
+                                logger.info("[VOLUME BREAKOUT] Override aktif! Harga di luar OB tetapi Volume Breakout terdeteksi. Izinkan BUY.")
+                            else:
+                                logger.info("[SMC FILTER] Harga di dalam zona OB (dengan buffer). Izinkan BUY.")
+                    else:
+                        action_val = 2 # HOLD
+                        logger.info("[ADAPTIVE FILTER] Harga tidak di OB dan tidak ada Volume Breakout. HOLD.")
                 elif action_val == 0: # SELL
-                    if not (ob_type == "bearish" and ob_bottom <= current_price <= ob_top):
-                        logger.info("[SMC FILTER] Harga tidak berada di zona Order Block. Mengabaikan sinyal AI.")
-                        action_val = 2
+                    if ob_valid_sell or is_volume_breakout:
+                        # Lanjutkan eksekusi SELL (Pastikan MTF H1 juga mengizinkan)
+                        if macro_trend is not None and macro_trend == 1:
+                            logger.info("Sinyal SELL dibatalkan: Melawan tren makro Bullish (H1).")
+                            elapsed = time.time() - start_time
+                            logger.info(f'=== Siklus Evaluasi Selesai (Durasi: {elapsed:.2f} detik) ===')
+                            return
+                        else:
+                            if is_volume_breakout and not ob_valid_sell:
+                                logger.info("[VOLUME BREAKOUT] Override aktif! Harga di luar OB tetapi Volume Breakout terdeteksi. Izinkan SELL.")
+                            else:
+                                logger.info("[SMC FILTER] Harga di dalam zona OB (dengan buffer). Izinkan SELL.")
+                    else:
+                        action_val = 2 # HOLD
+                        logger.info("[ADAPTIVE FILTER] Harga tidak di OB dan tidak ada Volume Breakout. HOLD.")
             else:
                 logger.warning("[SMC FILTER] Gagal mendeteksi Order Block. Filter dilewati.")
-            
-            macro_trend = check_macro_trend(SYMBOL)
-            if macro_trend is not None:
-                if action_val == 1 and macro_trend == 0:
-                    logger.info("Sinyal BUY dibatalkan: Melawan tren makro Bearish (H4).")
+                if action_val == 1 and macro_trend is not None and macro_trend == 0:
+                    logger.info("Sinyal BUY dibatalkan: Melawan tren makro Bearish (H1).")
                     elapsed = time.time() - start_time
                     logger.info(f'=== Siklus Evaluasi Selesai (Durasi: {elapsed:.2f} detik) ===')
                     return
-                elif action_val == 0 and macro_trend == 1:
-                    logger.info("Sinyal SELL dibatalkan: Melawan tren makro Bullish (H4).")
+                elif action_val == 0 and macro_trend is not None and macro_trend == 1:
+                    logger.info("Sinyal SELL dibatalkan: Melawan tren makro Bullish (H1).")
                     elapsed = time.time() - start_time
                     logger.info(f'=== Siklus Evaluasi Selesai (Durasi: {elapsed:.2f} detik) ===')
                     return
