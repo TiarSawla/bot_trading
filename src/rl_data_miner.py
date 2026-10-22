@@ -5,6 +5,17 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 
+# MT5 Timeframe mapping
+TIMEFRAME_MAP = {
+    "M1": 1,          # mt5.TIMEFRAME_M1
+    "M5": 5,          # mt5.TIMEFRAME_M5
+    "M15": 15,        # mt5.TIMEFRAME_M15
+    "M30": 16,        # mt5.TIMEFRAME_M30
+    "H1": 16385,      # mt5.TIMEFRAME_H1
+    "H4": 16388,      # mt5.TIMEFRAME_H4
+    "D1": 16408,      # mt5.TIMEFRAME_D1
+}
+
 # MT5 library import
 try:
     import MetaTrader5 as mt5
@@ -92,7 +103,7 @@ def fetch_mt5_data(symbol, timeframe, num_bars):
         print(f"[WARNING] Could not select symbol '{symbol}' in Market Watch.")
 
     # Copy rates from MT5
-    print(f"[INFO] Copying {num_bars} rates of {symbol} for timeframe M15...")
+    print(f"[INFO] Copying {num_bars} rates of {symbol} for timeframe {timeframe}...")
     rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, num_bars)
     
     mt5.shutdown()
@@ -175,17 +186,82 @@ def compute_features(df):
     df["fvg_status"] = 0
     df.loc[df["low"] > df["high"].shift(2), "fvg_status"] = 1
     df.loc[df["high"] < df["low"].shift(2), "fvg_status"] = -1
-
+    
+    df = add_smc_features(df)
     return df
 
+def add_smc_features(df):
+    atr = df["atr_14"].copy() if "atr_14" in df.columns else (df["high"] - df["low"]).rolling(14).mean()
+    atr = atr.replace(0, 0.01).fillna(0.01)
+    lb = 3
+    df["swing_high"] = 0
+    df["swing_low"] = 0
+    n = len(df)
+    for i in range(lb, n - lb):
+        if df["high"].iloc[i] == max(df["high"].iloc[i - lb : i + lb + 1]):
+            df.at[df.index[i], "swing_high"] = 1
+        if df["low"].iloc[i] == min(df["low"].iloc[i - lb : i + lb + 1]):
+            df.at[df.index[i], "swing_low"] = 1
+    df["bos_status"] = 0
+    sh_idx = df.index[df["swing_high"] == 1].tolist()
+    sl_idx = df.index[df["swing_low"] == 1].tolist()
+    for i in range(2, n):
+        for idx in reversed(sh_idx):
+            if idx < df.index[i] and df["high"].iloc[i] > df.loc[idx, "high"]:
+                df.at[df.index[i], "bos_status"] = 1
+                break
+        if df["bos_status"].iloc[i] == 0:
+            for idx in reversed(sl_idx):
+                if idx < df.index[i] and df["low"].iloc[i] < df.loc[idx, "low"]:
+                    df.at[df.index[i], "bos_status"] = -1
+                    break
+    df["mss_status"] = 0
+    for i in range(5, n):
+        h1, h2, h3 = df["high"].iloc[i - 2], df["high"].iloc[i - 1], df["high"].iloc[i]
+        l2, l3 = df["low"].iloc[i - 1], df["low"].iloc[i]
+        if h3 > h2 and l3 > l2 and h2 > h1:
+            df.at[df.index[i], "mss_status"] = 1
+        elif h3 < h2 and l3 < l2 and h2 < h1:
+            df.at[df.index[i], "mss_status"] = -1
+    df["fvg_strength"] = 0.0
+    for i in range(2, n):
+        atr_i = atr.iloc[i]
+        if df["low"].iloc[i] > df["high"].iloc[i - 2]:
+            df.at[df.index[i], "fvg_strength"] = min((df["low"].iloc[i] - df["high"].iloc[i - 2]) / atr_i, 3.0)
+        elif df["high"].iloc[i] < df["low"].iloc[i - 2]:
+            df.at[df.index[i], "fvg_strength"] = min((df["low"].iloc[i - 2] - df["high"].iloc[i]) / atr_i, 3.0)
+    df["liquidity_distance"] = 3.0
+    for i in range(1, n):
+        price = df["close"].iloc[i]
+        atr_i = atr.iloc[i]
+        d_high = [((df.loc[idx, "high"] - price) / atr_i) for idx in reversed(sh_idx) if idx <= df.index[i] and df.loc[idx, "high"] > price]
+        d_low = [((price - df.loc[idx, "low"]) / atr_i) for idx in reversed(sl_idx) if idx <= df.index[i] and df.loc[idx, "low"] < price]
+        cands = []
+        if d_high:
+            cands.append(d_high[0])
+        if d_low:
+            cands.append(d_low[0])
+        if cands:
+            df.at[df.index[i], "liquidity_distance"] = min(min(cands), 5.0)
+    df["liquidity_sweep"] = 0
+    for i in range(2, n):
+        if df["low"].iloc[i] < df["low"].iloc[i - 1] and df["close"].iloc[i] > df["close"].iloc[i - 1]:
+            df.at[df.index[i], "liquidity_sweep"] = 1
+        elif df["high"].iloc[i] > df["high"].iloc[i - 1] and df["close"].iloc[i] < df["close"].iloc[i - 1]:
+            df.at[df.index[i], "liquidity_sweep"] = -1
+    return df
 
 def main():
     parser = argparse.ArgumentParser(description="RL Historical Data Miner from MT5")
     parser.add_argument("--symbol", type=str, default="XAUUSD", help="Symbol to mine (e.g. XAUUSD, XAUUSDm)")
+    parser.add_argument("--timeframe", type=str, default="M15", choices=TIMEFRAME_MAP.keys(), help="Timeframe (default: M15)")
     parser.add_argument("--bars", type=int, default=10000, help="Number of bars to retrieve (default: 10000)")
-    parser.add_argument("--output", type=str, default="data/xauusd_m15_rl_train.csv", help="Path to save output CSV")
+    parser.add_argument("--output", type=str, default=None, help="Path to save output CSV (default: data/<symbol>_<timeframe>_rl_train.csv)")
     parser.add_argument("--mock", action="store_true", help="Force mock data generation without connecting to MT5")
     args = parser.parse_args()
+
+    if args.output is None:
+        args.output = f"data/{args.symbol.lower()}_{args.timeframe.lower()}_rl_train.csv"
 
     df = None
 
@@ -193,7 +269,8 @@ def main():
         df = generate_mock_data(args.bars)
     else:
         # Try fetching from MT5
-        df = fetch_mt5_data(args.symbol, mt5.TIMEFRAME_M15, args.bars)
+        timeframe_val = TIMEFRAME_MAP[args.timeframe]
+        df = fetch_mt5_data(args.symbol, timeframe_val, args.bars)
         if df is None:
             print("[WARNING] Could not fetch data from MT5. Falling back to Mock data to verify pipeline...")
             df = generate_mock_data(args.bars)

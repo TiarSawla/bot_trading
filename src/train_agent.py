@@ -3,6 +3,7 @@
 
 import os
 import sys
+import argparse
 import pandas as pd
 
 # Menambahkan root directory ke sys.path agar module 'src' dapat ditemukan saat dijalankan langsung
@@ -14,8 +15,15 @@ from stable_baselines3 import PPO
 from src.rl_environment import GoldTradingEnv
 
 def train():
-    # 1. Muat dataset historis
-    csv_path = "data/xauusd_m15_rl_train.csv"
+    parser = argparse.ArgumentParser(description="Train PPO Gold Trading Agent")
+    parser.add_argument("--csv", type=str, default="data/xauusd_m15_rl_train.csv", help="Path dataset CSV")
+    parser.add_argument("--output", type=str, default="models/ppo_gold_scalper_v4_smc", help="Model output path without .zip")
+    parser.add_argument("--timesteps", type=int, default=1000000, help="Training timesteps")
+    parser.add_argument("--window-size", type=int, default=10, help="Observation window size")
+    parser.add_argument("--learning-rate", type=float, default=0.0003, help="PPO learning rate")
+    args = parser.parse_args()
+
+    csv_path = args.csv
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Dataset tidak ditemukan di path: {csv_path}. Jalankan rl_data_miner.py terlebih dahulu.")
         
@@ -23,34 +31,29 @@ def train():
     df = pd.read_csv(csv_path)
     print(f"Dataset berhasil dimuat. Total bar/baris data: {len(df)}")
     
-    # 2. Inisialisasi Environment RL kustom
     print("Menginisialisasi GoldTradingEnv...")
-    env = GoldTradingEnv(df)
+    env = GoldTradingEnv(df, window_size=args.window_size)
+    print(f"Observation shape: {env.observation_space.shape}")
     
-    # 3. Buat model PPO dengan kebijakan MlpPolicy (tabular/flat feature observations)
     print("Inisialisasi model PPO dengan MlpPolicy...")
     model = PPO(
         policy="MlpPolicy",
         env=env,
-        learning_rate=0.0003,
+        learning_rate=args.learning_rate,
         verbose=1,
         tensorboard_log="./tensorboard_logs/"
     )
     
-    # 4. Latih model RL (1,000,000 timesteps)
-    total_timesteps = 1000000
-    print(f"Memulai pelatihan model PPO untuk {total_timesteps} timesteps...")
-    model.learn(total_timesteps=total_timesteps)
+    print(f"Memulai pelatihan model PPO untuk {args.timesteps} timesteps...")
+    model.learn(total_timesteps=args.timesteps)
     
-    # 5. Buat direktori penyimpanan jika belum ada dan simpan model
-    models_dir = "models"
+    models_dir = os.path.dirname(args.output) or "models"
     os.makedirs(models_dir, exist_ok=True)
     
-    model_save_path = os.path.join(models_dir, "ppo_gold_scalper_v3")
-    print(f"Menyimpan model yang telah dilatih ke {model_save_path}...")
-    model.save(model_save_path)
+    print(f"Menyimpan model yang telah dilatih ke {args.output}...")
+    model.save(args.output)
     
-    print(f"Sukses: Model RL PPO berhasil dilatih dan disimpan ke '{model_save_path}.zip'!")
+    print(f"Sukses: Model RL PPO berhasil dilatih dan disimpan ke '{args.output}.zip'!")
 
 if __name__ == "__main__":
     train()

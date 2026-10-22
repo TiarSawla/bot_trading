@@ -81,6 +81,19 @@ class GoldTradingEnv(gym.Env):
         # Final Reward
         reward = step_reward - penalty
 
+        current_row = self.df.iloc[self.current_step]
+        bos = float(current_row.get('bos_status', 0))
+        mss = float(current_row.get('mss_status', 0))
+        sweep = float(current_row.get('liquidity_sweep', 0))
+        fvg = float(current_row.get('fvg_status', 0))
+        smc_score = bos + mss + sweep + fvg
+        if target_position == 1 and smc_score > 0:
+            reward += 0.05 * min(smc_score, 3)
+        elif target_position == -1 and smc_score < 0:
+            reward += 0.05 * min(abs(smc_score), 3)
+        elif smc_score != 0:
+            reward -= 0.05 * min(abs(smc_score), 3)
+
         # Update position
         self.current_position = target_position
 
