@@ -8,7 +8,7 @@ from rl_environment_agresif import GoldAggressiveGridEnv
 def train():
     parser = argparse.ArgumentParser(description="Train PPO Aggressive Grid Agent")
     parser.add_argument("--csv", type=str, default="data/xauusd_mtf_agresif.csv", help="Path dataset CSV")
-    parser.add_argument("--output", type=str, default="models/ppo_gold_agresif_mtf_v1", help="Output model path")
+    parser.add_argument("--output", type=str, default="models/ppo_gold_agresif_mtf_hybrid_v1", help="Output model path")
     parser.add_argument("--timesteps", type=int, default=3000000, help="Training timesteps")
     args = parser.parse_args()
 
@@ -22,11 +22,15 @@ def train():
     env = GoldAggressiveGridEnv(
         df=df,
         initial_balance=10000.0,
-        layer_distance=2.0,
-        max_layers=5,
+        layer_distance=3.5,
+        max_layers=7,
         lot_step=0.01,
-        tp_from_first_entry=1.0,
-        basket_sl_from_last_entry=4.0
+        tp_from_first_entry=1.2,
+        basket_sl_from_last_entry=0.0,
+        trail_trigger_profit=3.0,
+        trail_step_profit=3.0,
+        basket_tp_usd=2.0,
+        profit_lock_offset=0.15,
     )
 
     print("[INFO] Inisialisasi PPO...")
@@ -35,7 +39,7 @@ def train():
         env,
         verbose=1,
         learning_rate=0.0003,
-        tensorboard_log="./tensorboard_logs/AGR_MTF_V1/"
+        tensorboard_log="./tensorboard_logs/AGR_MTF_HYBRID_V1/"
     )
 
     print(f"[INFO] Training for {args.timesteps} steps...")

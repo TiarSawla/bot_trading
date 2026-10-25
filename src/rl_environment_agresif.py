@@ -23,6 +23,8 @@ class GoldAggressiveGridEnv(gym.Env):
         trail_step_profit: float = 3.0,
         contract_value_per_lot: float = 100.0,
         margin_per_001_lot: float = 20.0,
+        basket_tp_usd: float = 2.0,
+        profit_lock_offset: float = 0.15,
     ):
         super().__init__()
         self.df = df.copy()
@@ -37,6 +39,8 @@ class GoldAggressiveGridEnv(gym.Env):
         self.trail_step_profit = trail_step_profit
         self.contract_value_per_lot = contract_value_per_lot
         self.margin_per_001_lot = margin_per_001_lot
+        self.basket_tp_usd = basket_tp_usd
+        self.profit_lock_offset = profit_lock_offset
 
         self.features_df = self.df.select_dtypes(include=[np.number]).copy()
         if "time" in self.features_df.columns:
@@ -66,6 +70,8 @@ class GoldAggressiveGridEnv(gym.Env):
         self.trail_sl = None
         self.static_sl = None
         self.tp_price = None
+        self.profit_lock_active = False
+        self.last_exit_reason = None
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         super().reset(seed=seed)
@@ -81,12 +87,12 @@ class GoldAggressiveGridEnv(gym.Env):
         high = float(self.df.iloc[self.current_step]["high"])
         low = float(self.df.iloc[self.current_step]["low"])
 
-        if action == 1 and self.side <= 0:
-            self._close_all(price)
-            self._open_layer(1, price)
-        elif action == 2 and self.side >= 0:
-            self._close_all(price)
-            self._open_layer(-1, price)
+        # Live mode ignores opposite signals while a basket is active.
+        if not self.positions:
+            if action == 1:
+                self._open_layer(1, price)
+            elif action == 2:
+                self._open_layer(-1, price)
 
         self._manage_layers(price)
         self._manage_exit(high, low, price)
@@ -114,23 +120,29 @@ class GoldAggressiveGridEnv(gym.Env):
     def _open_layer(self, side: int, price: float):
         if len(self.positions) >= self.max_layers:
             return
-        lot = round((len(self.positions) + 1) * self.lot_step, 2)
+        if not self.positions:
+            self.last_exit_reason = None
+        layer = len(self.positions) + 1
+        multiplier = 1 if layer <= 2 else (2 if layer <= 4 else 3)
+        lot = round(multiplier * self.lot_step, 2)
         self.positions.append({"side": side, "price": price, "lot": lot})
         self.side = side
         self._refresh_targets()
 
-    def _close_all(self, price: float):
+    def _close_all(self, price: float, reason: str = "UNSPECIFIED"):
         if not self.positions:
             self.side = 0
             return
         pnl = self._floating_pnl(price)
         self.balance += pnl
         self.realized_pnl += pnl
+        self.last_exit_reason = reason
         self.positions.clear()
         self.side = 0
         self.trail_sl = None
         self.static_sl = None
         self.tp_price = None
+        self.profit_lock_active = False
 
     def _manage_layers(self, price: float):
         if not self.positions:
@@ -138,9 +150,32 @@ class GoldAggressiveGridEnv(gym.Env):
         side = self.side
         last = self.positions[-1]["price"]
         if side == 1 and price <= last - self.layer_distance:
-            self._open_layer(side, last - self.layer_distance)
+            self._open_layer(side, price)
         elif side == -1 and price >= last + self.layer_distance:
-            self._open_layer(side, last + self.layer_distance)
+            self._open_layer(side, price)
+
+    def _active_sl(self):
+        return self.trail_sl if self.trail_sl is not None else self.static_sl
+
+    def _is_safer_sl(self, candidate: float, side: int, current: Optional[float]) -> bool:
+        if current is None:
+            return True
+        return candidate > current if side == 1 else candidate < current
+
+    def _raise_sl(self, candidate: Optional[float], side: int, current_price: Optional[float] = None):
+        if candidate is None or candidate <= 0:
+            return
+        if current_price is not None:
+            valid_for_market = candidate < current_price if side == 1 else candidate > current_price
+            if not valid_for_market:
+                return
+        current = self._active_sl()
+        if not self._is_safer_sl(candidate, side, current):
+            return
+        if self.trail_sl is None and self.static_sl is None:
+            self.static_sl = candidate
+        else:
+            self.trail_sl = candidate
 
     def _manage_exit(self, high: float, low: float, close_price: float):
         if not self.positions:
@@ -148,35 +183,49 @@ class GoldAggressiveGridEnv(gym.Env):
         side = self.side
         floating = self._floating_pnl(close_price)
         avg = self._avg_price()
-        if len(self.positions) >= self.max_layers:
+
+        if len(self.positions) >= 2 and floating >= self.basket_tp_usd:
+            self.profit_lock_active = True
+
+        if len(self.positions) >= self.max_layers and self.basket_sl_from_last_entry > 0:
             last_price = self.positions[-1]["price"]
-            self.static_sl = last_price - self.basket_sl_from_last_entry if side == 1 else last_price + self.basket_sl_from_last_entry
-            if floating >= self.trail_trigger_profit:
-                step = int(floating / self.trail_step_profit)
-                lock = step * self.trail_step_profit if step > 0 else 0.0
-                self.trail_sl = avg + lock if side == 1 else avg - lock
-        sl = self.trail_sl if self.trail_sl is not None else self.static_sl
+            static_sl = last_price - self.basket_sl_from_last_entry if side == 1 else last_price + self.basket_sl_from_last_entry
+            self._raise_sl(static_sl, side)
+
         if self.tp_price is not None:
             if side == 1 and high >= self.tp_price:
-                self._close_all(self.tp_price)
+                self._close_all(self.tp_price, reason="BASKET_TP")
                 return
             if side == -1 and low <= self.tp_price:
-                self._close_all(self.tp_price)
+                self._close_all(self.tp_price, reason="BASKET_TP")
                 return
+
+        if self.profit_lock_active:
+            lock_sl = avg + self.profit_lock_offset if side == 1 else avg - self.profit_lock_offset
+            self._raise_sl(lock_sl, side, close_price)
+
+        if floating >= self.trail_trigger_profit and self.trail_step_profit > 0:
+            step = int(floating / self.trail_step_profit)
+            if step > 0:
+                trail_offset = step * self.trail_step_profit * 0.5
+                trail_sl = avg + trail_offset if side == 1 else avg - trail_offset
+                self._raise_sl(trail_sl, side, close_price)
+
+        sl = self._active_sl()
         if sl is not None:
             if side == 1 and low <= sl:
-                self._close_all(sl)
+                self._close_all(sl, reason="PROFIT_LOCK_SL" if self.profit_lock_active else "BASKET_SL")
             elif side == -1 and high >= sl:
-                self._close_all(sl)
+                self._close_all(sl, reason="PROFIT_LOCK_SL" if self.profit_lock_active else "BASKET_SL")
 
     def _refresh_targets(self):
         if not self.positions:
             return
-        first = self.positions[0]["price"]
+        avg = self._avg_price()
         if self.side == 1:
-            self.tp_price = first + self.tp_from_first_entry
+            self.tp_price = avg + self.tp_from_first_entry
         elif self.side == -1:
-            self.tp_price = first - self.tp_from_first_entry
+            self.tp_price = avg - self.tp_from_first_entry
 
     def _floating_pnl(self, price: float) -> float:
         total = 0.0
@@ -224,4 +273,8 @@ class GoldAggressiveGridEnv(gym.Env):
             "floating": self._floating_pnl(price),
             "margin_level": self._margin_level(price),
             "realized_pnl": self.realized_pnl,
+            "profit_lock_active": self.profit_lock_active,
+            "tp_price": self.tp_price,
+            "stop_price": self._active_sl(),
+            "last_exit_reason": self.last_exit_reason,
         }

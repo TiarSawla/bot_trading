@@ -487,7 +487,7 @@ def normalize_volume(symbol, volume):
     return round(max(normalized, minimum), 8)
 
 
-def close_position(position_ticket, position_type, symbol, volume):
+def close_position(position_ticket, position_type, symbol, volume, reason='UNSPECIFIED'):
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         logger.error(f'Gagal mengambil tick untuk close. Tiket: {position_ticket}. Error: {mt5.last_error()}')
@@ -510,12 +510,12 @@ def close_position(position_ticket, position_type, symbol, volume):
         'price': price,
         'deviation': DEVIATION,
         'magic': MAGIC_NUMBER,
-        'comment': 'Basket/Target Close',
+        'comment': f'Close {reason}',
         'type_time': mt5.ORDER_TIME_GTC,
         'type_filling': get_filling_mode(symbol),
     }
     if DRY_RUN:
-        logger.info(f'[DRY RUN] CLOSE order untuk tiket: {position_ticket}, volume: {volume} di harga {price}')
+        logger.info(f'[DRY RUN] [{reason}] CLOSE order untuk tiket: {position_ticket}, volume: {volume} di harga {price}')
         return True
 
     invalid_fill = getattr(mt5, 'TRADE_RETCODE_INVALID_FILL', 10030)
@@ -525,7 +525,7 @@ def close_position(position_ticket, position_type, symbol, volume):
         result = mt5.order_send(close_request)
         last_result = result
         if result is not None and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f'[SUCCESS] Berhasil menutup tiket {position_ticket} (Vol: {volume}) di harga {result.price}')
+            logger.info(f'[SUCCESS] [{reason}] Berhasil menutup tiket {position_ticket} (Vol: {volume}) di harga {result.price}')
             return True
         if result is None:
             break
@@ -533,9 +533,9 @@ def close_position(position_ticket, position_type, symbol, volume):
             break
 
     if last_result is None:
-        logger.error(f'Gagal menutup tiket {position_ticket}: hasil order_send None. Error: {mt5.last_error()}')
+        logger.error(f'[{reason}] Gagal menutup tiket {position_ticket}: hasil order_send None. Error: {mt5.last_error()}')
     else:
-        logger.error(f'Gagal menutup tiket {position_ticket}. Retcode: {last_result.retcode}, Deskripsi: {last_result.comment}')
+        logger.error(f'[{reason}] Gagal menutup tiket {position_ticket}. Retcode: {last_result.retcode}, Deskripsi: {last_result.comment}')
     return False
 
 
@@ -748,13 +748,13 @@ def get_margin_level() -> float:
     return margin_level
 
 
-def close_all_bot_positions(symbol: str, magic: int):
+def close_all_bot_positions(symbol: str, magic: int, reason='UNSPECIFIED'):
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
         return
     for pos in positions:
         if pos.magic == magic:
-            close_position(pos.ticket, pos.type, symbol, pos.volume)
+            close_position(pos.ticket, pos.type, symbol, pos.volume, reason=reason)
             time.sleep(0.1)
 
 
@@ -764,7 +764,7 @@ def emergency_margin_protection(symbol: str, magic: int) -> bool:
     margin_level = get_margin_level()
     if margin_level < EMERGENCY_MARGIN_LEVEL:
         logger.warning(f"[EMERGENCY MARGIN] Margin Level {margin_level:.2f}% < {EMERGENCY_MARGIN_LEVEL:.2f}%. Close semua posisi bot.")
-        close_all_bot_positions(symbol, magic)
+        close_all_bot_positions(symbol, magic, reason='EMERGENCY_MARGIN')
         return True
     return False
 
@@ -783,7 +783,7 @@ def manage_grid(symbol: str, magic: int):
     - Jika ada posisi yang sedang floating minus dan bergerak berlawanan sejauh GRID_LAYER_DISTANCE_PIPS,
       buka layer baru searah untuk menarik harga rata-rata (BEP) mendekati harga market.
     - Tidak melakukan Cut Loss selama HARD_CUT_MARGIN_LEVEL = 0.
-    - Menutup seluruh posisi secara kolektif begitu harga menyentuh TP Rata-Rata (BEP + TP) atau mencapai BASKET_TP_USD.
+    - Mengaktifkan profit-lock saat BASKET_TP_USD tercapai; close hanya melalui TP harga atau safety exit.
     """
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
@@ -836,7 +836,7 @@ def manage_grid(symbol: str, magic: int):
             total_profit = sum(p.profit + p.swap for p in buy_pos)
             if total_profit < 0 and margin_level < HARD_CUT_MARGIN_LEVEL:
                 logger.warning(f"[HARD CUT LOSS] Margin Level {margin_level:.2f}% < {HARD_CUT_MARGIN_LEVEL:.2f}%. Close All BUY.")
-                close_all_positions(symbol, magic, mt5.POSITION_TYPE_BUY)
+                close_all_positions(symbol, magic, mt5.POSITION_TYPE_BUY, reason='HARD_CUT_MARGIN')
                 return
 
     # --- MANAGE SELL LAYERING ---
@@ -862,7 +862,7 @@ def manage_grid(symbol: str, magic: int):
             total_profit = sum(p.profit + p.swap for p in sell_pos)
             if total_profit < 0 and margin_level < HARD_CUT_MARGIN_LEVEL:
                 logger.warning(f"[HARD CUT LOSS] Margin Level {margin_level:.2f}% < {HARD_CUT_MARGIN_LEVEL:.2f}%. Close All SELL.")
-                close_all_positions(symbol, magic, mt5.POSITION_TYPE_SELL)
+                close_all_positions(symbol, magic, mt5.POSITION_TYPE_SELL, reason='HARD_CUT_MARGIN')
                 return
 
     # Kelola TP Basket secara kolektif berdasarkan harga rata-rata (BEP)
@@ -899,14 +899,14 @@ def place_dual_pending_orders(symbol: str, magic: int):
     place_pending_order(symbol, mt5.ORDER_TYPE_SELL_STOP, lot, sell_price, None, None)
 
 
-def close_all_positions(symbol: str, magic: int, pos_type: int):
-    """Tutup semua posisi dengan tipe tertentu"""
+def close_all_positions(symbol: str, magic: int, pos_type: int, reason='UNSPECIFIED'):
+    """Tutup semua posisi dengan tipe tertentu dan catat alasan close."""
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
         return
     for pos in positions:
         if pos.magic == magic and pos.type == pos_type:
-            close_position(pos.ticket, pos.type, symbol, pos.volume)
+            close_position(pos.ticket, pos.type, symbol, pos.volume, reason=reason)
             time.sleep(0.1)
 
 
@@ -974,21 +974,21 @@ def manage_basket_tp_sl(symbol: str, magic: int, buy_pos: list, sell_pos: list):
 
         basket_pnl = total_profit
 
-        # 1. Jika total profit keranjang sudah mencapai BASKET_TP_USD, langsung tutup semua posisi agar profit diamankan
-        if len(positions) >= 2 and basket_pnl >= BASKET_TP_USD:
-            logger.info(f"[BASKET PROFIT TARGET] Total Profit {'BUY' if is_buy else 'SELL'} (${basket_pnl:.2f}) >= Target (${BASKET_TP_USD:.2f}). Menutup semua layer!")
-            close_all_positions(symbol, magic, pos_type)
-            return
+        # 1. Target profit mengaktifkan lock; basket tetap diberi peluang menuju TP harga.
+        profit_lock_active = len(positions) >= 2 and basket_pnl >= BASKET_TP_USD
 
         # 2. Hitung harga TP kolektif dari HARGA RATA-RATA (avg_price / BEP), bukan dari entry pertama!
         tp_distance = TP_FROM_FIRST_ENTRY_PIPS * XAU_PIP_VALUE
         tp_price = round(avg_price + tp_distance, digits) if is_buy else round(avg_price - tp_distance, digits)
 
+        if profit_lock_active:
+            logger.info(f"[BASKET PROFIT LOCK] {'BUY' if is_buy else 'SELL'} | PnL: ${basket_pnl:.2f} >= Target: ${BASKET_TP_USD:.2f} | TP: {tp_price} | Lock SL dipertahankan/ditingkatkan")
+
         # Tutup di market jika harga sudah melewati tp_price dan keranjang sudah positif
         target_reached = tick.bid >= tp_price if is_buy else tick.ask <= tp_price
         if target_reached and basket_pnl > 0:
             logger.info(f"[BASKET TP] Target rata-rata {'BUY' if is_buy else 'SELL'} ({tp_price}) tercapai (PnL: ${basket_pnl:.2f}); menutup seluruh basket di market.")
-            close_all_positions(symbol, magic, pos_type)
+            close_all_positions(symbol, magic, pos_type, reason='BASKET_TP')
             return
 
         # 3. Pengaturan SL & Trailing Basket (Tanpa SL saat rugi jika BASKET_SL_PIPS == 0)
@@ -996,22 +996,39 @@ def manage_basket_tp_sl(symbol: str, magic: int, buy_pos: list, sell_pos: list):
         if BASKET_SL_PIPS > 0 and len(positions) >= MAX_LAYERS:
             new_sl = round(last_entry.price_open - basket_sl_distance, digits) if is_buy else round(last_entry.price_open + basket_sl_distance, digits)
 
-        # Kunci profit (Break-Even Plus) jika seluruh keranjang sudah profit >= $1.00
-        if basket_pnl >= 1.0:
+        # Pertahankan lock lama; target hybrid juga wajib melewati jalur ini.
+        if basket_pnl >= 1.0 or profit_lock_active:
             be_plus = 0.15
-            new_sl = round(avg_price + be_plus, digits) if is_buy else round(avg_price - be_plus, digits)
+            lock_sl = round(avg_price + be_plus, digits) if is_buy else round(avg_price - be_plus, digits)
+            if is_buy:
+                lock_sl = round(min(lock_sl, tick.bid - min_distance), digits)
+                if lock_sl > avg_price:
+                    new_sl = lock_sl
+                else:
+                    logger.warning(f"[BASKET PROFIT LOCK] BUY belum memiliki SL profit valid setelah stop/freeze validation: candidate={lock_sl}, avg={avg_price}")
+            else:
+                lock_sl = round(max(lock_sl, tick.ask + min_distance), digits)
+                if lock_sl < avg_price:
+                    new_sl = lock_sl
+                else:
+                    logger.warning(f"[BASKET PROFIT LOCK] SELL belum memiliki SL profit valid setelah stop/freeze validation: candidate={lock_sl}, avg={avg_price}")
 
         if basket_pnl >= 3.0:
             step = int(basket_pnl / 3.0)
             trail_offset = (step * 3.0) * 0.5
             if is_buy:
                 trail_offset = min(trail_offset, max(tick.bid - min_distance - avg_price, 0.0))
+                trail_sl = round(avg_price + trail_offset, digits)
+                if trail_sl > avg_price and (new_sl is None or trail_sl > new_sl):
+                    new_sl = trail_sl
             else:
                 trail_offset = min(trail_offset, max(avg_price - tick.ask - min_distance, 0.0))
-            new_sl = round(avg_price + trail_offset, digits) if is_buy else round(avg_price - trail_offset, digits)
+                trail_sl = round(avg_price - trail_offset, digits)
+                if trail_sl < avg_price and (new_sl is None or trail_sl < new_sl):
+                    new_sl = trail_sl
             logger.info(f"[BASKET TRAIL] {'BUY' if is_buy else 'SELL'} | PnL: ${basket_pnl:.2f} | SL-> {new_sl}")
 
-        update_positions_sltp(positions, new_sl, tp_price, 'BASKET SLTP')
+        update_positions_sltp(positions, new_sl, tp_price, 'BASKET PROFIT LOCK' if profit_lock_active else 'BASKET SLTP')
 
     process_side(buy_pos, True)
     process_side(sell_pos, False)
@@ -1882,7 +1899,7 @@ def aggressive_bot_job():
                 pos = scalper_positions[0]
                 if (pos.type == 0 and confirmed_signal == "SELL") or (pos.type == 1 and confirmed_signal == "BUY"):
                     logger.info(f"[SCALPER TAKE PROFIT ON REVERSAL] Sinyal berlawanan saat posisi profit (${total_floating:.2f}). Menutup tiket {pos.ticket} dalam keadaan Profit!")
-                    close_position(pos.ticket, pos.type, SYMBOL, pos.volume)
+                    close_position(pos.ticket, pos.type, SYMBOL, pos.volume, reason='REVERSAL_PROFIT')
 
             # Bersihkan pending order yang belum tersentuh karena sudah ada posisi utama yang dikelola manage_grid
             for ord in scalper_orders:
