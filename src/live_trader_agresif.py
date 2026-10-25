@@ -729,14 +729,16 @@ def get_next_lot(current_layer: int, symbol: str = None) -> float:
       * Layer 5+    : 3x base_lot (0.03)
     """
     if ACCOUNT_TYPE == 'cent':
+        # Grid layering cent: L1=FIRST, L2=+0.02, L3=+0.04, L4=+0.04+STEP, L5+=+0.04+3*STEP
+        # Contoh .env default (CENT_FIRST_LAYER_LOT=0.05, STEP=0.01): 0.05/0.07/0.09/0.10/0.12
         if current_layer == 1:
             return round(CENT_FIRST_LAYER_LOT, 2)
         elif current_layer in (2, 3):
-            return round(CENT_FIRST_LAYER_LOT + (current_layer - 1) * 0.02, 2)
+            return round(CENT_FIRST_LAYER_LOT + 0.02 * (current_layer - 1), 2)
         elif current_layer == 4:
             return round(CENT_FIRST_LAYER_LOT + 0.04 + CENT_LAYER_LOT_STEP, 2)
         else:
-            return round(CENT_FIRST_LAYER_LOT + 0.04 + CENT_LAYER_LOT_STEP + (CENT_LAYER_LOT_STEP * 2), 2)
+            return round(CENT_FIRST_LAYER_LOT + 0.04 + CENT_LAYER_LOT_STEP * 3, 2)
 
     base_lot = get_dynamic_lot(symbol or SYMBOL)
     multiplier = 1 if current_layer <= 2 else (2 if current_layer <= 4 else 3)
