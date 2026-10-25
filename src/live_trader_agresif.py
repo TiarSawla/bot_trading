@@ -82,8 +82,12 @@ CENT_FIRST_LAYER_LOT = float(os.getenv('CENT_FIRST_LAYER_LOT', '0.05'))
 STANDARD_LAYER_LOT_STEP = float(os.getenv('STANDARD_LAYER_LOT_STEP', '0.01'))
 BASKET_SL_PIPS = float(os.getenv('BASKET_SL_PIPS', '0'))                    # 0 = Tanpa SL Basket
 TP_FROM_FIRST_ENTRY_PIPS = float(os.getenv('TP_FROM_FIRST_ENTRY_PIPS', '12'))  # Target TP 12 pips ($1.20) dari harga rata-rata (BEP)
-NEWS_CACHE_SECONDS = 60
+NEWS_CACHE_SECONDS = 300
 NEWS_CACHE = {'checked_at': 0.0, 'blocked': False}
+
+# Throttle & log-once state untuk manajemen SL/TP basket
+_sltp_last_update = {}   # key -> timestamp update terakhir (anti-flicker 5 detik)
+_last_sltp_log = {}      # key -> timestamp log terakhir (log sekali per jam)
 
 MODEL_TIMEFRAMES = (
     ('', mt5.TIMEFRAME_M1),
@@ -692,9 +696,11 @@ def check_high_impact_news():
         NEWS_CACHE.update(checked_at=now, blocked=False)
         return False
     except Exception as e:
-        logger.warning(f"[NEWS FILTER] Gagal mengambil kalender berita ({e}). Melanjutkan trading tanpa blokir berita.")
-        NEWS_CACHE.update(checked_at=now, blocked=False)
-        return False
+        # Jika fetch gagal (misal 429 rate-limit), PERTAHANAN state blok terakhir
+        # (jangan reset ke non-blocked) agar filter tidak buta saat error.
+        logger.warning(f"[NEWS FILTER] Gagal mengambil kalender berita ({e}). Mempertahankan state terakhir ({NEWS_CACHE['blocked']}).")
+        NEWS_CACHE['checked_at'] = now
+        return NEWS_CACHE['blocked']
 
 
 def get_basket_avg_price(symbol, magic, pos_type=None):
@@ -920,7 +926,8 @@ def manage_basket_tp_sl(symbol: str, magic: int, buy_pos: list, sell_pos: list):
     basket_sl_distance = BASKET_SL_PIPS * XAU_PIP_VALUE
     min_distance = get_min_trade_distance(symbol) or 0.0
 
-    def update_positions_sltp(positions: list, new_sl=None, new_tp=None, label='BASKET'):
+    def update_positions_sltp(positions: list, new_sl=None, new_tp=None, label='BASKET',
+                              avg_price=None, require_profit_side=False):
         for pos in positions:
             current_sl = pos.sl
             current_tp = pos.tp
@@ -941,6 +948,40 @@ def manage_basket_tp_sl(symbol: str, magic: int, buy_pos: list, sell_pos: list):
                     candidate_tp = round(candidate_tp, digits)
                 else:
                     candidate_tp = None
+
+            # --- Guard P3: SL tidak boleh melewati TP ---
+            # BUY:  SL harus di bawah TP.  Jika SL >= TP -> jangan kirim SL (biarkan TP penentu).
+            # SELL: SL harus di atas TP.  Jika SL <= TP -> jangan kirim SL (biarkan TP penentu).
+            if candidate_sl is not None and candidate_tp is not None:
+                if is_buy and candidate_sl >= candidate_tp:
+                    candidate_sl = None
+                elif (not is_buy) and candidate_sl <= candidate_tp:
+                    candidate_sl = None
+            if candidate_sl is None and new_sl is not None:
+                now_ts = time.time()
+                key = ('SL_TP_GUARD', pos.ticket)
+                if now_ts - _last_sltp_log.get(key, 0.0) > 3600:
+                    _last_sltp_log[key] = now_ts
+                    logger.warning(
+                        f"[{label}] Tiket {pos.ticket} kandidat SL={new_sl} melewati TP={new_tp}; "
+                        f"dibatalkan agar tidak memotong profit."
+                    )
+
+            # --- Guard sisi-profit (P1/P2): lock SL tidak boleh jatuh di sisi rugi ---
+            # BUY: SL lock harus di atas avg. SELL: SL lock harus di bawah avg.
+            # Jika clamp broker mendorong ke sisi rugi, pertahankan SL lama (jangan pemotong loss).
+            if require_profit_side and candidate_sl is not None and avg_price is not None:
+                profit_side_ok = candidate_sl > avg_price if is_buy else candidate_sl < avg_price
+                if not profit_side_ok:
+                    candidate_sl = None
+                    now_ts = time.time()
+                    key = ('LOSS_SIDE_SL', pos.ticket)
+                    if now_ts - _last_sltp_log.get(key, 0.0) > 3600:
+                        _last_sltp_log[key] = now_ts
+                        logger.warning(
+                            f"[{label}] Tiket {pos.ticket} SL={new_sl} terdorong ke sisi rugi "
+                            f"(avg={avg_price:.2f}); dipertahankan SL lama agar tidak memotong loss."
+                        )
 
             sl_changed = candidate_sl is not None and (current_sl == 0 or (is_buy and candidate_sl > current_sl) or (not is_buy and candidate_sl < current_sl))
             tp_changed = candidate_tp is not None and abs(current_tp - candidate_tp) > (10 ** -digits)
@@ -974,8 +1015,15 @@ def manage_basket_tp_sl(symbol: str, magic: int, buy_pos: list, sell_pos: list):
 
         basket_pnl = total_profit
 
-        # 1. Target profit mengaktifkan lock; basket tetap diberi peluang menuju TP harga.
-        profit_lock_active = len(positions) >= 2 and basket_pnl >= BASKET_TP_USD
+        # 1. Lock profit hanya mengaktifkan SL sisi-profit ketika basket sudah benar-benar profit
+        #    (harga live melewati avg + min_distance di sisi profit). PnL >= target saja tidak cukup
+        #    karena di akun premium/cent nilai PnL ter-skala sehingga threshold nominal mudah tercapai
+        #    padahal harga masih di sisi rugi -> akan memasang SL yang kemudian memotong loss.
+        on_profit_side = (
+            (tick.bid - avg_price) > min_distance if is_buy
+            else (avg_price - tick.ask) > min_distance
+        )
+        profit_lock_active = len(positions) >= 2 and on_profit_side and basket_pnl >= BASKET_TP_USD
 
         # 2. Hitung harga TP kolektif dari HARGA RATA-RATA (avg_price / BEP), bukan dari entry pertama!
         tp_distance = TP_FROM_FIRST_ENTRY_PIPS * XAU_PIP_VALUE
@@ -996,39 +1044,100 @@ def manage_basket_tp_sl(symbol: str, magic: int, buy_pos: list, sell_pos: list):
         if BASKET_SL_PIPS > 0 and len(positions) >= MAX_LAYERS:
             new_sl = round(last_entry.price_open - basket_sl_distance, digits) if is_buy else round(last_entry.price_open + basket_sl_distance, digits)
 
-        # Pertahankan lock lama; target hybrid juga wajib melewati jalur ini.
-        if basket_pnl >= 1.0 or profit_lock_active:
+        # 4. Lock SL (break-even plus): hanya dipasang saat basket berada di sisi profit,
+        #    menjaga SL tetap di sisi yang menguntungkan (BELUM memotong kerugian).
+        #    Jika kandidat jatuh di sisi rugi, skip (tidak dipaksa) agar tidak jadi jebakan loss.
+        if profit_lock_active:
             be_plus = 0.15
             lock_sl = round(avg_price + be_plus, digits) if is_buy else round(avg_price - be_plus, digits)
             if is_buy:
-                lock_sl = round(min(lock_sl, tick.bid - min_distance), digits)
+                # SL BUY harus berada di bawah harga live (bid - min_distance)
+                if min_distance > 0:
+                    lock_sl = min(lock_sl, round(tick.bid - min_distance, digits))
                 if lock_sl > avg_price:
                     new_sl = lock_sl
                 else:
-                    logger.warning(f"[BASKET PROFIT LOCK] BUY belum memiliki SL profit valid setelah stop/freeze validation: candidate={lock_sl}, avg={avg_price}")
+                    # Kandidat lock jatuh di sisi rugi -> jangan pasang SL yang memotong loss.
+                    now_ts = time.time()
+                    key = ('LOCK_SLTP', pos_type)
+                    last_log = _last_sltp_log.get(key, 0.0)
+                    if now_ts - last_log > 3600:
+                        _last_sltp_log[key] = now_ts
+                        logger.warning(
+                            f"[BASKET PROFIT LOCK] {('BUY' if is_buy else 'SELL')} kandidat SL "
+                            f"{lock_sl} jatuh di sisi rugi (avg={avg_price:.2f}); skip agar tidak memotong loss."
+                        )
             else:
-                lock_sl = round(max(lock_sl, tick.ask + min_distance), digits)
+                # SL SELL harus berada di atas harga live (ask + min_distance)
+                if min_distance > 0:
+                    lock_sl = max(lock_sl, round(tick.ask + min_distance, digits))
                 if lock_sl < avg_price:
                     new_sl = lock_sl
                 else:
-                    logger.warning(f"[BASKET PROFIT LOCK] SELL belum memiliki SL profit valid setelah stop/freeze validation: candidate={lock_sl}, avg={avg_price}")
+                    now_ts = time.time()
+                    key = ('LOCK_SLTP', pos_type)
+                    last_log = _last_sltp_log.get(key, 0.0)
+                    if now_ts - last_log > 3600:
+                        _last_sltp_log[key] = now_ts
+                        logger.warning(
+                            f"[BASKET PROFIT LOCK] {('BUY' if is_buy else 'SELL')} kandidat SL "
+                            f"{lock_sl} jatuh di sisi rugi (avg={avg_price:.2f}); skip agar tidak memotong loss."
+                        )
 
-        if basket_pnl >= 3.0:
-            step = int(basket_pnl / 3.0)
-            trail_offset = (step * 3.0) * 0.5
+        # 5. Trailing basket: aktif saat profit lock (P1) atau basket cukup profit.
+        #    offset = 50% profit per-unit, dibatasi (a) min_distance agar SL valid,
+        #    (b) 50% basket_pnl agar tidak mengambang jauh dari harga live
+        #    (fokus: loss per reversal kecil, profit tetap dominan).
+        #    Aturan "SL tidak boleh melewati TP" dipaksakan di update_positions_sltp.
+        if profit_lock_active or basket_pnl >= 3.0:
+            profit_per_unit = max(tick.bid - avg_price if is_buy else avg_price - tick.ask, 0.0)
+            # Trailing agresif: SL mengunci 50% dari keuntungan per-unit.
+            # Jika PnL basket masih kecil, SL tetap ketat (min_distance dari avg),
+            # sehingga loss per-reversal kecil; profit tetap dominan.
+            trail_offset = 0.5 * profit_per_unit
+            trail_offset = max(trail_offset, min_distance)
             if is_buy:
-                trail_offset = min(trail_offset, max(tick.bid - min_distance - avg_price, 0.0))
                 trail_sl = round(avg_price + trail_offset, digits)
                 if trail_sl > avg_price and (new_sl is None or trail_sl > new_sl):
                     new_sl = trail_sl
             else:
-                trail_offset = min(trail_offset, max(avg_price - tick.ask - min_distance, 0.0))
                 trail_sl = round(avg_price - trail_offset, digits)
                 if trail_sl < avg_price and (new_sl is None or trail_sl < new_sl):
                     new_sl = trail_sl
             logger.info(f"[BASKET TRAIL] {'BUY' if is_buy else 'SELL'} | PnL: ${basket_pnl:.2f} | SL-> {new_sl}")
 
-        update_positions_sltp(positions, new_sl, tp_price, 'BASKET PROFIT LOCK' if profit_lock_active else 'BASKET SLTP')
+        # 6. Anti-flicker: tulis SL/TP hanya jika ada perubahan nyata, dan throttle
+        #    per tiket 5 detik. Throttle di-level harga (bukan per tiket) karena semua
+        #    tiket di basket ini memakai harga baru yang sama.
+        def _sltp_wanted_differs(pos, sl_candidate, tp_candidate):
+            if sl_candidate is None and tp_candidate is None:
+                return False
+            cur_sl, cur_tp = pos.sl, pos.tp
+            if sl_candidate is not None and abs(sl_candidate - cur_sl) > (10 ** -digits):
+                return True
+            if tp_candidate is not None and abs(tp_candidate - cur_tp) > (10 ** -digits):
+                return True
+            return False
+
+        need_update = any(_sltp_wanted_differs(p, new_sl, tp_price) for p in positions)
+        now_ts = time.time()
+        throttle_key = ('SLTP_THROTTLE', pos_type)
+        last_update = _sltp_last_update.get(throttle_key, 0.0)
+        throttled = need_update and (now_ts - last_update) < 5.0
+
+        if not throttled and need_update:
+            _sltp_last_update[throttle_key] = now_ts
+            update_positions_sltp(
+                positions, new_sl, tp_price,
+                'BASKET PROFIT LOCK' if profit_lock_active else 'BASKET SLTP',
+                avg_price=avg_price,
+                require_profit_side=profit_lock_active,
+            )
+        elif need_update and profit_lock_active:
+            # Log sesekali untuk menginformasikan bahwa update tertunda karena throttle
+            if now_ts - _last_sltp_log.get(('TRAIL_THROTTLE', pos_type), 0.0) > 30:
+                _last_sltp_log[('TRAIL_THROTTLE', pos_type)] = now_ts
+                logger.debug(f"[BASKET TRAIL] Throttled (5s/tiket): akan di-update pada siklus berikutnya")
 
     process_side(buy_pos, True)
     process_side(sell_pos, False)
